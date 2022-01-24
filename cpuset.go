@@ -17,143 +17,119 @@
 package cgroups
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	v1 "github.com/containerd/cgroups/stats/v1"
 )
 
-func NewCpuset(root string) *cpusetController {
-	return &cpusetController{
-		root: filepath.Join(root, string(Cpuset)),
+const nanosecondsInSecond = 1000000000
+
+var clockTicks = getClockTicks()
+
+func NewCpuacct(root string) *cpuacctController {
+	return &cpuacctController{
+		root: filepath.Join(root, string(Cpuacct)),
 	}
 }
 
-type cpusetController struct {
+type cpuacctController struct {
 	root string
 }
 
-func (c *cpusetController) Name() Name {
-	return Cpuset
+func (c *cpuacctController) Name() Name {
+	return Cpuacct
 }
 
-func (c *cpusetController) Path(path string) string {
+func (c *cpuacctController) Path(path string) string {
 	return filepath.Join(c.root, path)
 }
 
-func (c *cpusetController) Create(path string, resources *specs.LinuxResources) error {
-	if err := c.ensureParent(c.Path(path), c.root); err != nil {
+func (c *cpuacctController) Stat(path string, stats *v1.Metrics) error {
+	user, kernel, err := c.getUsage(path)
+	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(c.Path(path), defaultDirPerm); err != nil {
+	total, err := readUint(filepath.Join(c.Path(path), "cpuacct.usage"))
+	if err != nil {
 		return err
 	}
-	if err := c.copyIfNeeded(c.Path(path), filepath.Dir(c.Path(path))); err != nil {
+	percpu, err := c.percpuUsage(path)
+	if err != nil {
 		return err
 	}
-	if resources.CPU != nil {
-		for _, t := range []struct {
-			name  string
-			value string
-		}{
-			{
-				name:  "cpus",
-				value: resources.CPU.Cpus,
-			},
-			{
-				name:  "mems",
-				value: resources.CPU.Mems,
-			},
-		} {
-			if t.value != "" {
-				if err := retryingWriteFile(
-					filepath.Join(c.Path(path), "cpuset."+t.name),
-					[]byte(t.value),
-					defaultFilePerm,
-				); err != nil {
-					return err
-				}
-			}
-		}
-	}
+    
+    CfsPeriodUs, err := readUint(filepath.Join(c.Path(path), "cpu.cfs_period_us"))
+    if err != nil {
+        return err
+    }
+    CfsQuotaUs, err := readUint(filepath.Join(c.Path(path), "cpu.cfs_quota_us"))
+    if err != nil {
+        return err
+    }
+    stats.CPU.Usage.CfsPeriodUs = CfsPeriodUs
+    stats.CPU.Usage.CfsQuotaUs = CfsQuotaUs
+
+	stats.CPU.Usage.Total = total
+	stats.CPU.Usage.User = user
+	stats.CPU.Usage.Kernel = kernel
+	stats.CPU.Usage.PerCPU = percpu
 	return nil
 }
 
-func (c *cpusetController) Update(path string, resources *specs.LinuxResources) error {
-	return c.Create(path, resources)
-}
-
-func (c *cpusetController) getValues(path string) (cpus []byte, mems []byte, err error) {
-	if cpus, err = ioutil.ReadFile(filepath.Join(path, "cpuset.cpus")); err != nil && !os.IsNotExist(err) {
-		return
+func (c *cpuacctController) percpuUsage(path string) ([]uint64, error) {
+	var usage []uint64
+	data, err := ioutil.ReadFile(filepath.Join(c.Path(path), "cpuacct.usage_percpu"))
+	if err != nil {
+		return nil, err
 	}
-	if mems, err = ioutil.ReadFile(filepath.Join(path, "cpuset.mems")); err != nil && !os.IsNotExist(err) {
-		return
-	}
-	return cpus, mems, nil
-}
-
-// ensureParent makes sure that the parent directory of current is created
-// and populated with the proper cpus and mems files copied from
-// it's parent.
-func (c *cpusetController) ensureParent(current, root string) error {
-	parent := filepath.Dir(current)
-	if _, err := filepath.Rel(root, parent); err != nil {
-		return nil
-	}
-	// Avoid infinite recursion.
-	if parent == current {
-		return fmt.Errorf("cpuset: cgroup parent path outside cgroup root")
-	}
-	if cleanPath(parent) != root {
-		if err := c.ensureParent(parent, root); err != nil {
-			return err
+	for _, v := range strings.Fields(string(data)) {
+		u, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, err
 		}
+		usage = append(usage, u)
 	}
-	if err := os.MkdirAll(current, defaultDirPerm); err != nil {
-		return err
-	}
-	return c.copyIfNeeded(current, parent)
+	return usage, nil
 }
 
-// copyIfNeeded copies the cpuset.cpus and cpuset.mems from the parent
-// directory to the current directory if the file's contents are 0
-func (c *cpusetController) copyIfNeeded(current, parent string) error {
-	var (
-		err                      error
-		currentCpus, currentMems []byte
-		parentCpus, parentMems   []byte
-	)
-	if currentCpus, currentMems, err = c.getValues(current); err != nil {
-		return err
+func (c *cpuacctController) getUsage(path string) (user uint64, kernel uint64, err error) {
+	statPath := filepath.Join(c.Path(path), "cpuacct.stat")
+	data, err := ioutil.ReadFile(statPath)
+	if err != nil {
+		return 0, 0, err
 	}
-	if parentCpus, parentMems, err = c.getValues(parent); err != nil {
-		return err
+	fields := strings.Fields(string(data))
+	if len(fields) != 4 {
+		return 0, 0, fmt.Errorf("%q is expected to have 4 fields", statPath)
 	}
-	if isEmpty(currentCpus) {
-		if err := retryingWriteFile(
-			filepath.Join(current, "cpuset.cpus"),
-			parentCpus,
-			defaultFilePerm,
-		); err != nil {
-			return err
+	for _, t := range []struct {
+		index int
+		name  string
+		value *uint64
+	}{
+		{
+			index: 0,
+			name:  "user",
+			value: &user,
+		},
+		{
+			index: 2,
+			name:  "system",
+			value: &kernel,
+		},
+	} {
+		if fields[t.index] != t.name {
+			return 0, 0, fmt.Errorf("expected field %q but found %q in %q", t.name, fields[t.index], statPath)
 		}
-	}
-	if isEmpty(currentMems) {
-		if err := retryingWriteFile(
-			filepath.Join(current, "cpuset.mems"),
-			parentMems,
-			defaultFilePerm,
-		); err != nil {
-			return err
+		v, err := strconv.ParseUint(fields[t.index+1], 10, 64)
+		if err != nil {
+			return 0, 0, err
 		}
+		*t.value = v
 	}
-	return nil
-}
-
-func isEmpty(b []byte) bool {
-	return len(bytes.Trim(b, "\n")) == 0
+	return (user * nanosecondsInSecond) / clockTicks, (kernel * nanosecondsInSecond) / clockTicks, nil
 }
