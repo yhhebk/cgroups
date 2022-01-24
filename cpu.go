@@ -100,6 +100,7 @@ func (c *cpuController) Update(path string, resources *specs.LinuxResources) err
 }
 
 func (c *cpuController) Stat(path string, stats *v1.Metrics) error {
+      
 	f, err := os.Open(filepath.Join(c.Path(path), "cpu.stat"))
 	if err != nil {
 		return err
